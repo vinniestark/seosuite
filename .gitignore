@@ -4,3 +4,7 @@
 env/
 testurls
 config.yaml
+_seoreporter_html_
+/*.xls
+/seocrawler/jobs
+/jobs

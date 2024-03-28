@@ -1,5 +1,6 @@
  # -*- coding: utf-8 -*-
 
+import os
 import sys
 import time
 import uuid
@@ -9,6 +10,7 @@ import hashlib
 import json
 from urlparse import urlparse, urljoin
 import atexit
+import gzip
 
 from bs4 import BeautifulSoup
 
@@ -19,37 +21,44 @@ html_parser = "lxml"
 
 TIMEOUT = 16
 
+JOBS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'jobs')
+
 def crawl(urls, db, internal=False, delay=0, user_agent=None,
-    url_associations={}, run_id=None, processed_urls={}):
+    url_associations={}, run_id=None, processed_urls={}, limit=0):
 
     run_id = run_id or uuid.uuid4()
     print "Starting crawl with run_id: %s" % run_id
 
-    def _save_state(db, run_id, urls, url_associations):
-        cur = db.cursor()
+    def _save_state(run_id, u, ua):
 
-        try:
-            cur.execute('DELETE FROM crawl_save WHERE run_id = %s', (run_id,))
-            cur.execute('INSERT INTO crawl_save (`run_id`, `urls`, `url_associations`) VALUES(%s, %s, %s)', (
-                run_id,
-                json.dumps(urls),
-                json.dumps(url_associations)))
-            db.commit()
-            print 'Crawler job exited. Run id: %s' % run_id
-        except Exception, e:
-            print e
-            db.rollback()
+        if not os.path.exists(JOBS_DIR):
+            os.makedirs(JOBS_DIR)
+
+        print len(u), len(ua)
+        if len(u) == 0 and len(ua) == 0:
             return
 
-    atexit.register(_save_state, db, run_id, urls, url_associations)
+        # open the job file
+        with gzip.open("%s/%s.gz" % (JOBS_DIR, run_id), 'w+') as f:
+            data = {
+                'urls': u,
+                'associations': ua,
+            }
+
+            f.write(json.dumps(data))
+
+
+    atexit.register(_save_state, run_id, urls, url_associations)
 
     run_count = 0
+    limit_reached = False
     while len(urls) > 0:
         run_count += 1
-        url = urls.pop(0)
+        url = urls[0]
 
         print "\nProcessing (%d / %d): %s" % (run_count, len(urls), url)
         if not is_full_url(url):
+            processed_urls[url] = urls.pop(0)
             continue
             # raise ValueError('A relative url as provided: %s. Please ensure that all urls are absolute.' % url)
 
@@ -62,7 +71,7 @@ def crawl(urls, db, internal=False, delay=0, user_agent=None,
             lint_errors = {}
             page_details = {}
 
-            if res['code'] == 200:
+            if res['code'] == 200 and res['content_type'] == 'text/html':
 
                 lint_errors, page_details, links, sources = process_html(res['content'], res['url'])
 
@@ -97,8 +106,11 @@ def crawl(urls, db, internal=False, delay=0, user_agent=None,
                             else:
                                 associate_link(db, record, processed_urls[link_url], run_id, 'anchor', link.get('text'), link.get('alt'), link.get('rel'))
 
-                        elif internal and link_url not in processed_urls and link_url not in urls:
-                            urls.append(link_url)
+                        elif internal and is_internal_url(link_url, url) and link_url not in processed_urls and link_url not in urls:
+                            if not limit_reached:
+                                urls.append(link_url)
+                                if limit and len(urls) >= limit:
+                                    limit_reached = True
                             url_associations[url][link_url] = link
 
                 # Process sources from the page
@@ -110,8 +122,8 @@ def crawl(urls, db, internal=False, delay=0, user_agent=None,
                             source_results = retrieve_url(source_url, user_agent, False)
 
                             for source_result in source_results:
-                                internal = is_internal_url(source_result['url'], url)
-                                source_store = store_results(db, run_id, source_result, {}, {}, not internal)
+                                source_internal = is_internal_url(source_result['url'], url)
+                                source_store = store_results(db, run_id, source_result, {}, {}, not source_internal)
                                 processed_urls[source_url] = source_store
                                 associate_link(db, record, source_store, run_id, 'asset', None, source.get('alt'), None)
 
@@ -123,12 +135,20 @@ def crawl(urls, db, internal=False, delay=0, user_agent=None,
                 processed_urls[url] = record
 
         time.sleep( delay / 1000.0 )
+        urls.pop(0)
 
     # Process associations
     for url, associations in url_associations.iteritems():
         for association, link in associations.iteritems():
-            if association in processed_urls:
-                associate_link(db, processed_urls[url], processed_urls[association], run_id, 'anchor', link.get('text'), link.get('alt'), link.get('rel'))
+            to_id = processed_urls.get(url)
+            from_id = processed_urls.get(association)
+            if to_id and from_id and from_id != to_id:
+                associate_link(db, to_id, from_id, run_id, 'anchor', link.get('text'), link.get('alt'), link.get('rel'))
+
+    # Clean up any save files that might exist
+    if os.path.exists('%s/%s.gz' % (JOBS_DIR, run_id)):
+        print "Deleting job file (%s/%s.gz)" % (JOBS_DIR, run_id)
+        os.remove('%s/%s.gz' % (JOBS_DIR, run_id))
 
     return run_id
 
@@ -163,10 +183,10 @@ def retrieve_url(url, user_agent=None, full=True):
         sys.stdout.flush()
 
         start = time.time()
-        if full:
+        res = requests.head(url, headers=headers, timeout=TIMEOUT)
+
+        if full and res.headers.get('content-type', '').split(';')[0] == 'text/html':
             res = requests.get(url, headers=headers, timeout=TIMEOUT)
-        else:
-            res = requests.head(url, headers=headers, timeout=TIMEOUT)
 
         if len(res.history) > 0:
             request_time = 0
@@ -198,7 +218,7 @@ def retrieve_url(url, user_agent=None, full=True):
 
 def process_html(html, url):
 
-    lint_errors = seolinter.lint(html)
+    lint_errors = seolinter.lint_html(html)
 
     page_details = extract_page_details(html, url)
 
@@ -221,7 +241,7 @@ def extract_links(html, url):
             full_url = a_tag.get('href')
             valid = False
 
-        if full_url: # Ignore any a tags that don't have an href
+        if full_url and 'mailto:' not in full_url: # Ignore any a tags that don't have an href
             links.append({
                 'url': full_url,
                 'valid': valid,
@@ -243,6 +263,7 @@ def extract_sources(html, url):
         source_url = link.get('src') or link.get('href')
         if not source_url:
             continue
+        source_url = source_url.strip()
         if not is_full_url(source_url):
             full_url = make_full_url(source_url, url)
         else:
@@ -293,7 +314,7 @@ def store_results(db, run_id, stats, lint_errors, page_details, external=False, 
 
     insert = '''
 INSERT INTO `crawl_urls` (
-  `run_id`, `level`, `content_hash`, 
+  `run_id`, `level`, `content_hash`,
   `address`, `domain`, `path`, `external`, `status_code`, `status`, `body`, `size`, `address_length`, `encoding`, `content_type`, `response_time`, `redirect_uri`, `canonical`,
   `title_1`, `title_length_1`, `title_occurences_1`, `meta_description_1`, `meta_description_length_1`, `meta_description_occurrences_1`, `h1_1`, `h1_length_1`, `h1_2`, `h1_length_2`, `h1_count`, `meta_robots`, `rel_next`, `rel_prev`,
   `lint_critical`, `lint_error`, `lint_warn`, `lint_info`, `lint_results`, `timestamp`) VALUES (
@@ -308,6 +329,11 @@ INSERT INTO `crawl_urls` (
         content = stats.get('content', '')
         content_hash = hashlib.sha256(content.encode('ascii', 'ignore')).hexdigest()
         lint_keys = [k.upper() for k in lint_errors.keys()]
+        try:
+            lint_res = json.dumps(lint_errors)
+        except:
+            lint_res = '[]'
+        s = int(stats.get('size', 0))
         cur.execute(insert, (
             run_id,
             content_hash if content else None,                  # content_hash
@@ -320,7 +346,7 @@ INSERT INTO `crawl_urls` (
             stats.get('code'),                                  # status_code
             stats.get('reason'),                                # status
             stats.get('content', ''),                           # body
-            stats.get('size'),                                  # size
+            s if s >= 0 else 0,                                 # size
             len(url),                                           # address_length
             stats.get('encoding'),                              # encoding
             stats.get('content_type'),                          # content_type
@@ -381,12 +407,16 @@ def make_full_url(url, source_url):
     return full.split('#')[0]
 
 
-def associate_link(db, from_id, to_id, run_id, link_type, text, alt, rel):
+def associate_link(db, from_url_id, to_url_id, run_id, link_type, text, alt, rel):
+    if not from_url_id or not to_url_id or not run_id:
+        print "Failed to save association (From:", from_url_id, "To:", to_url_id, ")"
+        return False
+
     cur = db.cursor()
 
     association = '''
 INSERT INTO `crawl_links` (
-  `run_id`, `type`, `from_id`, `to_id`, `link_text`, `alt_text`, `rel`)
+  `run_id`, `type`, `from_url_id`, `to_url_id`, `link_text`, `alt_text`, `rel`)
  VALUES (%s, %s, %s, %s, %s, %s, %s)
     '''
 
@@ -394,8 +424,8 @@ INSERT INTO `crawl_links` (
         cur.execute(association, (
             run_id,
             link_type,
-            from_id,
-            to_id,
+            from_url_id,
+            to_url_id,
             text.encode('ascii', 'ignore') if text else None,
             alt.encode('ascii', 'ignore') if alt else None,
             rel,
@@ -408,8 +438,11 @@ INSERT INTO `crawl_links` (
     return db.insert_id()
 
 def _get_base_url(url):
-    res = urlparse(url)
-    return res.netloc
+    try:
+        res = urlparse(url)
+        return res.netloc
+    except:
+        return None
 
 def _get_path(url):
     base = _get_base_url(url)

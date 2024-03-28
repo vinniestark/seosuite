@@ -14,6 +14,7 @@
 import yaml
 import time
 import datetime
+import os
 
 import MySQLdb
 
@@ -23,13 +24,14 @@ def report(db, report_type, report_format, run_id):
     global start
     report_data = []
     start = time.time()
+    # print [report_type, report_format, run_id]
 
     if report_type == 'build':
         report_data = build_report(db, run_id)
     elif report_type == 'status_code':
         report_data = status_code_report(db, run_id)
     elif report_type == 'all':
-        report_data = build_report(db, run_id)
+        report_data = all_report(db, run_id)
     else:
         raise Exception('Report type not supported')
 
@@ -41,6 +43,8 @@ def report(db, report_type, report_format, run_id):
         return xls_format(report_type, report_data, run_id)
     elif report_format == 'sql':
         return sql_format(report_type, report_data, run_id)
+    elif report_format == 'html_files':
+        return html_files_format(report_type, report_data, run_id)
     else:
         raise Exception('Report format not supported')
 
@@ -250,25 +254,53 @@ def xls_format(report_type, tests, run_id):
      xmlns:x="urn:schemas-microsoft-com:office:excel"
      xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
      xmlns:html="http://www.w3.org/TR/REC-html40">
-      '''
+     <DocumentProperties xmlns="urn:schemas-microsoft-com:office:office">
+      <Version>14.0</Version>
+     </DocumentProperties>
+     <OfficeDocumentSettings xmlns="urn:schemas-microsoft-com:office:office">
+      <AllowPNG/>
+     </OfficeDocumentSettings>
+     <ExcelWorkbook xmlns="urn:schemas-microsoft-com:office:excel">
+      <WindowHeight>8000</WindowHeight>
+      <WindowWidth>15000</WindowWidth>
+      <WindowTopX>120</WindowTopX>
+      <WindowTopY>140</WindowTopY>
+      <ProtectStructure>False</ProtectStructure>
+      <ProtectWindows>False</ProtectWindows>
+     </ExcelWorkbook>
+     <Styles>
+      <Style ss:ID="Default" ss:Name="Normal">
+       <Alignment ss:Vertical="Bottom"/>
+       <Borders/>
+       <Font ss:FontName="Calibri" x:Family="Swiss" ss:Size="12" ss:Color="#000000"/>
+       <Interior/>
+       <NumberFormat/>
+       <Protection/>
+      </Style>
+     </Styles>'''
 
     def xls_row(values):
-        o = '\t<Row>\n'
+        o = '          <Row>\n'
         for v in values:
-            o += '\t\t<Cell><Data ss:Type="String">' + str(v) + '</Data></Cell>\n'
-        return o + '\t</Row>\n'
+            o += '           <Cell>\n            <Data ss:Type="String">' + str(v) + '</Data>\n           </Cell>\n'
+        return o + '          </Row>\n'
 
     for test in tests:
         if test['values'] and len(test['values']) > 0:
             # header
-            output += '\n<Worksheet ss:Name="%s"><Table ss:ExpandedColumnCount="%s" x:FullColumns="1" x:FullRows="1">' % (test['name'].replace('_', ' ').title(), 2 + len(test['values'][0].keys()))
+            output += '\n        <Worksheet ss:Name="%s"><Table ss:ExpandedColumnCount="%s" x:FullColumns="1" x:FullRows="1" ss:DefaultColumnWidth="150" ss:DefaultRowHeight="15">\n' % (test['name'].replace('_', ' ').title(), 2 + len(test['values'][0].keys()))
             output += xls_row(['Run Id'] + [o.replace('_', ' ').title() for o in test['values'][0].keys()])
             # values
             for row in test['values']:
                 output += xls_row([run_id] + [str(v) for v in row.values()])
             # footer
-            output += '\n</Table></Worksheet>'
-
+            output += '''          </Table>
+          <WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel">
+           <PageLayoutZoom>0</PageLayoutZoom>
+           <ProtectObjects>False</ProtectObjects>
+           <ProtectScenarios>False</ProtectScenarios>
+          </WorksheetOptions>
+        </Worksheet>'''
     output += '\n</Workbook>'
 
     return output
@@ -278,7 +310,7 @@ def csv_format(report_type, tests, run_id):
     output = ""
 
     def csv_row(values):
-        return '\n' + ",".join(values)
+        return ",".join(values) + '\n'
 
     for test in tests:
         if test['values'] and len(test['values']) > 0:
@@ -288,6 +320,28 @@ def csv_format(report_type, tests, run_id):
             for row in test['values']:
                 output += csv_row([run_id, test['name'].replace('_', ' ').title()] + [str(v) for v in row.values()])
     return output
+
+
+def html_files_format(report_type, tests, run_id):
+    def file_row(path, content, folder_name="_seoreporter_html_", ext="html"):
+        path_name = path[:50].replace('http://', '').replace('https://', '').replace('/', '__')
+        file_name = folder_name + "/" + path_name + '.' + ext
+
+        if not os.path.exists(folder_name):
+            os.mkdir(folder_name)
+
+        with open(file_name, "w") as text_file:
+            text_file.write(content)
+
+    # print tests
+    for test in tests:
+        if test['values'] and len(test['values']) > 0:
+            for row in test['values']:
+                # print row
+                if row['content_type'] == 'text/html':
+                    file_row(row['address'], row['body'])
+
+    return 'Done.'
 
 
 def sql_format(report_type, tests, run_id):
